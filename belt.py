@@ -58,17 +58,37 @@ class Pick(Instruction):
         self.cons = cons
         self.alt  = alt
 
-#program = [Const(10), Const(0), Pick(0, 0, 1), Return([0])]
+def get_labels(instructions):
+    labels = {}
+    i = 0
+    for ins in instructions:
+        if not ins:
+            continue
+        if ins[-1] == ':':
+            labels[ins[:-1]] = i
+        else:
+            i += 1
+    return labels
+
+def convert_arg(val, labels):
+    val = rstring.strip_spaces(val)
+    if val in labels:
+        return labels[val]
+    val = val[1:] if val[0] == 'b' or val[0] == 'B' else val
+    return int(val, 10)
 
 def parse(input):
     program = []
-    lines = rstring.split(input, '\n')
+    lines   = [rstring.strip_spaces(i) for i in rstring.split(input, '\n')]
+    labels  = get_labels(lines)
     for line in lines:
         line = [i for i in rstring.split(line, ' ') if i]
         if not line:
             continue
-        ins, args = line[0], [int(i, 10) for i in line[1:]]
-        if ins == "const":
+        ins, args = line[0].lower(), [convert_arg(i, labels) for i in line[1:]]
+        if ins[-1] == ':':
+            continue
+        elif ins == "const":
             val = Const(args[0])
         elif ins == "call":
             val = Call(args[0], args[1:])
@@ -88,52 +108,6 @@ def parse(input):
             raise Exception("Unparsable instruction %s" % ins)
         program.append(val)
     return program[:]
-
-#t0 = """
-#ENTRY:
-    #CONST FIB
-    #CONST 35
-    #CALL B1  B0
-    #RETURN B0
-#FIB:
-    #CONST 1
-    #CONST DONE
-    #CONST NEXT
-    #LTE B3  B2      ;; n <= 1
-    #PICK B0  B2  B1 ;; pick our jump destination
-    #JUMP B0         ;; if (n <= 1) { goto DONE } { goto NEXT }
-#DONE:
-    #RETURN B4
-#NEXT:
-    #SUB B5  B4   ;; n-1
-    #SUB B0  B5   ;; n-2
-    #CONST FIB
-    #CALL B0  B2 ;; fib(n-1)
-    #CALL B1  B2 ;; fib(n-2)
-    #ADD B0  B1
-    #RETURN B0
-#"""
-
-#test = [
-    #Const(30),
-    #Const(4),
-    #Call(0, [1]),
-    #Return([0]),
-    #Const(1),
-    #Const(10),
-    #Const(11),
-    #Lte(3, 2),
-    #Pick(0, 2, 1),
-    #Jump(0),
-    #Return([4]),
-    #Sub(5, 4),
-    #Sub(0, 5),
-    #Const(4),
-    #Call(0, [2]),
-    #Call(1, [2]),
-    #Add(0, 1),
-    #Return([0])
-    #]
 
 driver = jit.JitDriver(reds=["stack", "belt"], greens=["pc", "program"])
 
