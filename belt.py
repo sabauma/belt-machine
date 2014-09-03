@@ -13,43 +13,57 @@ class ActivationRecord(object):
         self.belt = belt
 
 class Instruction(object):
-    pass
+    def tostring(self):
+        return str(self)
 
 class Const(Instruction):
     _immutable_fields_ = ["value"]
     def __init__(self, val):
         self.value = val
+    def tostring(self):
+        return "CONST %d" % self.value
 
 class Call(Instruction):
     _immutable_fields_ = ["destination", "args[*]"]
     def __init__(self, destination, args):
         self.destination = destination
-        self.args        = args
+        self.args        = [i for i in reversed(args)]
+    def tostring(self):
+        args = " ".join(["B%d" % i for i in reversed(self.args)])
+        return "CALL B%d %s" % (self.destination, args)
 
 class Jump(Instruction):
     _immutable_fields_ = ["destination"]
     def __init__(self, destination):
         self.destination = destination
+    def tostring(self):
+        return "JUMP B%d" % self.destination
 
 class Return(Instruction):
     _immutable_fields_ = ["results[*]"]
     def __init__(self, results):
-        self.results = results
+        self.results = [i for i in reversed(results)]
+    def tostring(self):
+        args = " ".join(["B%d" % i for i in reversed(self.results)])
+        return "RETURN %s" % args
 
 class Binop(Instruction):
     _immutable_fields_ = ["lhs", "rhs"]
+    name = "BINOP"
     def __init__(self, lhs, rhs):
         self.lhs = lhs
         self.rhs = rhs
+    def tostring(self):
+        return "%s B%d B%d" % (self.name, self.lhs, self.rhs)
 
 class Add(Binop):
-    pass
+    name = "ADD"
 
 class Sub(Binop):
-    pass
+    name = "SUB"
 
 class Lte(Binop):
-    pass
+    name = "LTE"
 
 class Pick(Instruction):
     _immutable_fields_ = ["pred", "cons", "alt"]
@@ -57,6 +71,8 @@ class Pick(Instruction):
         self.pred = pred
         self.cons = cons
         self.alt  = alt
+    def tostring(self):
+        return "PICK B%d B%d B%d" % (self.pred, self.cons, self.alt)
 
 def get_labels(instructions):
     labels = {}
@@ -109,7 +125,14 @@ def parse(input):
         program.append(val)
     return program[:]
 
-driver = jit.JitDriver(reds=["stack", "belt"], greens=["pc", "program"])
+def get_printable_location(pc, program):
+    if pc is None or program is None:
+        return "Greens are None"
+    return "%d: %s" % (pc, program[pc].tostring())
+
+driver = jit.JitDriver(reds=["stack", "belt"],
+                       greens=["pc", "program"],
+                       get_printable_location=get_printable_location)
 
 class Belt(object):
     _immutable_fields_ = ["length", "data"]
@@ -139,7 +162,7 @@ def main_loop(program):
             stack    = ActivationRecord(stack, pc + 1, belt)
             new_belt = Belt(BELT_LEN)
             target   = belt.get(ins.destination)
-            for i in reversed(ins.args):
+            for i in ins.args:
                 new_belt.put(belt.get(i))
             can_enter = target < pc
             belt = new_belt
@@ -154,9 +177,9 @@ def main_loop(program):
                 driver.can_enter_jit(pc=pc, program=program, belt=belt, stack=stack)
         elif typ is Return:
             if stack is None:
-                print "Results", [belt.get(i) for i in ins.results]
+                print "Results", [belt.get(i) for i in reversed(ins.results)]
                 break
-            for i in reversed(ins.results):
+            for i in ins.results:
                 stack.belt.put(belt.get(i))
             pc, belt, stack = stack.pc, stack.belt, stack.prev
         elif typ is Add:
