@@ -6,11 +6,11 @@ from rpython.rlib import rstring
 BELT_LEN = 8
 
 class ActivationRecord(object):
-    _immutable_fields_ = ["prev", "pc", "belt"]
-    def __init__(self, prev, pc, belt):
-        self.prev = prev
+    _immutable_fields_ = ["pc", "belt", "prev"]
+    def __init__(self, pc, belt, prev):
         self.pc   = pc
         self.belt = belt
+        self.prev = prev
 
 class Instruction(object):
     def tostring(self):
@@ -135,21 +135,20 @@ driver = jit.JitDriver(reds=["stack", "belt"],
                        get_printable_location=get_printable_location)
 
 class Belt(object):
-    _immutable_fields_ = ["length", "data"]
-    def __init__(self, len):
-        self.start  = 0
-        self.data   = [0] * len
-        self.length = len
+    _immutable_fields_ = ["data"]
+    def __init__(self):
+        self.start = 0
+        self.data  = [0] * BELT_LEN
     def get(self, idx):
-        assert idx < self.length
+        assert 0 <= idx < len(data)
         return self.data[self.start - idx]
     def put(self, val):
-        self.start = (self.start + 1) % self.length
+        self.start = (self.start + 1) % BELT_LEN
         self.data[self.start] = val
 
 def main_loop(program):
     pc    = 0
-    belt  = Belt(BELT_LEN)
+    belt  = Belt()
     stack = None
     while True:
         driver.jit_merge_point(pc=pc, program=program, belt=belt, stack=stack)
@@ -159,8 +158,8 @@ def main_loop(program):
             belt.put(ins.value)
             pc += 1
         elif typ is Call:
-            stack    = ActivationRecord(stack, pc + 1, belt)
-            new_belt = Belt(BELT_LEN)
+            stack    = ActivationRecord(pc + 1, belt, stack)
+            new_belt = Belt()
             target   = belt.get(ins.destination)
             for i in ins.args:
                 new_belt.put(belt.get(i))
