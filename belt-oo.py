@@ -1,18 +1,27 @@
 
+
 from rpython.rlib import streamio
 from rpython.rlib import jit, debug, objectmodel
 from rpython.rlib import rstring
 
 BELT_LEN = 8
 
+class Done(Exception):
+    def __init__(self, vals):
+        self.values = vals
+
 class ActivationRecord(object):
-    _immutable_fields_ = ["pc", "belt", "prev"]
-    def __init__(self, pc, belt, prev):
+    _immutable_fields_ = ["prev", "pc", "belt"]
+    def __init__(self, prev, pc, belt):
+        self.prev = prev
         self.pc   = pc
         self.belt = belt
-        self.prev = prev
 
 class Instruction(object):
+    def __init__(self):
+        raise Exception("Abstract base class")
+    def interpret(self, pc, belt, stack):
+        raise Exception("Abstract base class")
     def tostring(self):
         return str(self)
 
@@ -20,14 +29,30 @@ class Const(Instruction):
     _immutable_fields_ = ["value"]
     def __init__(self, val):
         self.value = val
+
+    @jit.unroll_safe
+    def interpret(self, pc, belt, stack):
+        belt.put(self.value)
+        return pc + 1, belt, stack, False
+
     def tostring(self):
         return "CONST %d" % self.value
 
 class Call(Instruction):
-    _immutable_fields_ = ["destination", "args[*]"]
+    _immutable_fields_ = ["destination", "args"]
     def __init__(self, destination, args):
         self.destination = destination
         self.args        = [i for i in reversed(args)]
+
+    @jit.unroll_safe
+    def interpret(self, pc, belt, stack):
+        stack    = ActivationRecord(stack, pc + 1, belt)
+        new_belt = Belt()
+        target   = belt.get(self.destination)
+        for i in self.args:
+            new_belt.put(belt.get(i))
+        return target, new_belt, stack, target < pc
+
     def tostring(self):
         args = " ".join(["B%d" % i for i in reversed(self.args)])
         return "CALL B%d %s" % (self.destination, args)
@@ -36,13 +61,28 @@ class Jump(Instruction):
     _immutable_fields_ = ["destination"]
     def __init__(self, destination):
         self.destination = destination
+
+    @jit.unroll_safe
+    def interpret(self, pc, belt, stack):
+        target = belt.get(self.destination)
+        return target, belt, stack, target < pc
+
     def tostring(self):
         return "JUMP B%d" % self.destination
 
 class Return(Instruction):
-    _immutable_fields_ = ["results[*]"]
+    _immutable_fields_ = ["results"]
     def __init__(self, results):
         self.results = [i for i in reversed(results)]
+
+    @jit.unroll_safe
+    def interpret(self, pc, belt, stack):
+        if stack is None:
+            raise Done([belt.get(i) for i in reversed(self.results)])
+        for i in self.results:
+            stack.belt.put(belt.get(i))
+        return stack.pc, stack.belt, stack.prev, False
+
     def tostring(self):
         args = " ".join(["B%d" % i for i in reversed(self.results)])
         return "RETURN %s" % args
@@ -53,17 +93,41 @@ class Binop(Instruction):
     def __init__(self, lhs, rhs):
         self.lhs = lhs
         self.rhs = rhs
+
+    @staticmethod
+    def binop(v0, v1):
+        raise Exception("abstract method")
+
+    @jit.unroll_safe
+    def interpret(self, pc, belt, stack):
+        v0 = belt.get(self.lhs)
+        v1 = belt.get(self.rhs)
+        belt.put(self.binop(v0, v1))
+        return pc + 1, belt, stack, False
+
     def tostring(self):
         return "%s B%d B%d" % (self.name, self.lhs, self.rhs)
 
 class Add(Binop):
     name = "ADD"
 
+    @staticmethod
+    def binop(v0, v1):
+        return v0 + v1
+
 class Sub(Binop):
     name = "SUB"
 
+    @staticmethod
+    def binop(v0, v1):
+        return v0 - v1
+
 class Lte(Binop):
     name = "LTE"
+
+    @staticmethod
+    def binop(v0, v1):
+        return 1 if v0 <= v1 else 0
 
 class Pick(Instruction):
     _immutable_fields_ = ["pred", "cons", "alt"]
@@ -71,6 +135,12 @@ class Pick(Instruction):
         self.pred = pred
         self.cons = cons
         self.alt  = alt
+
+    @jit.unroll_safe
+    def interpret(self, pc, belt, stack):
+        belt.put(belt.get(self.cons) if belt.get(self.pred) != 0 else belt.get(self.alt))
+        return pc + 1, belt, stack, False
+
     def tostring(self):
         return "PICK B%d B%d B%d" % (self.pred, self.cons, self.alt)
 
@@ -91,7 +161,8 @@ def convert_arg(val, labels):
     if val in labels:
         return labels[val]
     val = val[1:] if val[0] == 'b' or val[0] == 'B' else val
-    return int(val, 10)
+    int_rep = int(val, 10)
+    return int_rep
 
 def parse(input):
     program = []
@@ -135,14 +206,18 @@ driver = jit.JitDriver(reds=["stack", "belt"],
                        get_printable_location=get_printable_location)
 
 class Belt(object):
-    _immutable_fields_ = ["data"]
+    #_immutable_fields_ = ["data"]
     def __init__(self):
         self.start = 0
         self.data  = [0] * BELT_LEN
+
     def get(self, idx):
-        assert 0 <= idx < len(self.data)
-        return self.data[self.start - idx]
+        jit.promote(self.start)
+        index = (self.start - idx) % BELT_LEN
+        return self.data[index]
+
     def put(self, val):
+        jit.promote(self.start)
         self.start = (self.start + 1) % BELT_LEN
         self.data[self.start] = val
 
@@ -150,57 +225,15 @@ def main_loop(program):
     pc    = 0
     belt  = Belt()
     stack = None
-    while True:
-        driver.jit_merge_point(pc=pc, program=program, belt=belt, stack=stack)
-        ins = program[pc]
-        typ = type(ins)
-        if typ is Const:
-            belt.put(ins.value)
-            pc += 1
-        elif typ is Call:
-            stack    = ActivationRecord(pc + 1, belt, stack)
-            new_belt = Belt()
-            target   = belt.get(ins.destination)
-            for i in ins.args:
-                new_belt.put(belt.get(i))
-            can_enter = target < pc
-            belt = new_belt
-            pc = target
+    try:
+        while True:
+            driver.jit_merge_point(pc=pc, program=program, belt=belt, stack=stack)
+            ins = program[pc]
+            pc, belt, stack, can_enter = ins.interpret(pc, belt, stack)
             if can_enter:
                 driver.can_enter_jit(pc=pc, program=program, belt=belt, stack=stack)
-        elif typ is Jump:
-            target = belt.get(ins.destination)
-            can_enter = target < pc
-            pc = target
-            if can_enter:
-                driver.can_enter_jit(pc=pc, program=program, belt=belt, stack=stack)
-        elif typ is Return:
-            if stack is None:
-                print "Results", [belt.get(i) for i in reversed(ins.results)]
-                break
-            for i in ins.results:
-                stack.belt.put(belt.get(i))
-            pc, belt, stack = stack.pc, stack.belt, stack.prev
-        elif typ is Add:
-            v0 = belt.get(ins.lhs)
-            v1 = belt.get(ins.rhs)
-            belt.put(v0 + v1)
-            pc += 1
-        elif typ is Sub:
-            v0 = belt.get(ins.lhs)
-            v1 = belt.get(ins.rhs)
-            belt.put(v0 - v1)
-            pc += 1
-        elif typ is Lte:
-            v0 = belt.get(ins.lhs)
-            v1 = belt.get(ins.rhs)
-            belt.put(1 if v0 <= v1 else 0)
-            pc += 1
-        elif typ is Pick:
-            belt.put(belt.get(ins.cons) if belt.get(ins.pred) != 0 else belt.get(ins.alt))
-            pc += 1
-        else:
-            raise Exception("Unimplemented opcode")
+    except Done as d:
+        print "Results: ", d.values
 
 def readfile_rpython(fname):
     f = streamio.open_file_as_stream(fname)
@@ -224,9 +257,9 @@ def entry_point(argv):
 
 def target(driver, args):
     if driver.config.translation.jit:
-        driver.exe_name = 'belt-%(backend)s'
+        driver.exe_name = 'belt-oo-%(backend)s'
     else:
-        driver.exe_name = 'belt-%(backend)s-nojit'
+        driver.exe_name = 'belt-oo-%(backend)s-nojit'
     return entry_point, None
 
 if __name__ == "__main__":
