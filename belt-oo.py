@@ -80,7 +80,10 @@ class Jump(Instruction):
     @jit.unroll_safe
     def interpret(self, pc, belt, stack):
         target = belt.get(self.destination)
-        return target, belt, stack, target < pc
+        can_enter = target < pc
+        if can_enter:
+            belt.reset()
+        return target, belt, stack, can_enter
 
     def tostring(self):
         return "JUMP B%d" % self.destination
@@ -213,16 +216,17 @@ def parse(input):
         program.append(val)
     return program[:]
 
-def get_printable_location(pc, belt_start, program):
+def get_printable_location(pc, program):
     if pc is None or program is None:
         return "Greens are None"
     return "%d: %s" % (pc, program[pc].tostring())
 
 driver = jit.JitDriver(reds=["stack", "belt"],
-                       greens=["pc", "belt_start", "program"],
+                       greens=["pc", "program"],
                        get_printable_location=get_printable_location)
 
 class Belt(object):
+    _immutable_fields_ = ["data"]
     def __init__(self):
         self.start = 0
         self.data  = [0] * BELT_LEN
@@ -241,10 +245,12 @@ class Belt(object):
     def reset(self):
         if self.start == 0:
             return
-        for i in range(BELT_LEN):
+        tmp = self.data[self.start]
+        for i in range(BELT_LEN - 1):
             j = (self.start + i) % BELT_LEN
-            self.data[i], self.data[j] = self.data[j], self.data[i]
-        self.start = 0
+            self.data[i] = self.data[j]
+        self.data[-1] = tmp
+        self.start    = 0
 
     @jit.unroll_safe
     def put(self, val):
@@ -258,11 +264,11 @@ def main_loop(program):
     stack = None
     try:
         while True:
-            driver.jit_merge_point(pc=pc, belt_start=belt.start, program=program, belt=belt, stack=stack)
+            driver.jit_merge_point(pc=pc, program=program, belt=belt, stack=stack)
             ins = program[pc]
             pc, belt, stack, can_enter = ins.interpret(pc, belt, stack)
             if can_enter:
-                driver.can_enter_jit(pc=pc, belt_start=belt.start, program=program, belt=belt, stack=stack)
+                driver.can_enter_jit(pc=pc, program=program, belt=belt, stack=stack)
     except Done as d:
         print "Results: ", d.values
 
