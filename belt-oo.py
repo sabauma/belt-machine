@@ -1,8 +1,8 @@
 
-
-from rpython.rlib import streamio
-from rpython.rlib import jit, debug, objectmodel
-from rpython.rlib import rstring
+import operator as op
+from   rpython.rlib import streamio
+from   rpython.rlib import jit, debug, objectmodel, unroll
+from   rpython.rlib import rstring
 
 BELT_LEN = 9
 
@@ -30,9 +30,9 @@ class Instruction(object):
 class Copy(Instruction):
     _immutable_fields_ = ["value"]
     def __init__(self, val):
+        assert 0 <= val < BELT_LEN
         self.value = val
 
-    @jit.unroll_safe
     def interpret(self, pc, belt, stack):
         belt.put(belt.get(self.value))
         return pc + 1, belt, stack, False
@@ -45,7 +45,6 @@ class Const(Instruction):
     def __init__(self, val):
         self.value = val
 
-    @jit.unroll_safe
     def interpret(self, pc, belt, stack):
         belt.put(self.value)
         return pc + 1, belt, stack, False
@@ -54,7 +53,7 @@ class Const(Instruction):
         return "CONST %d" % self.value
 
 class Call(Instruction):
-    _immutable_fields_ = ["destination", "args"]
+    _immutable_fields_ = ["destination", "args[*]"]
     def __init__(self, destination, args):
         self.destination = destination
         self.args        = [i for i in reversed(args)]
@@ -77,7 +76,6 @@ class Jump(Instruction):
     def __init__(self, destination):
         self.destination = destination
 
-    @jit.unroll_safe
     def interpret(self, pc, belt, stack):
         target = belt.get(self.destination)
         return target, belt, stack, target < pc
@@ -86,7 +84,7 @@ class Jump(Instruction):
         return "JUMP B%d" % self.destination
 
 class Return(Instruction):
-    _immutable_fields_ = ["results"]
+    _immutable_fields_ = ["results[*]"]
     def __init__(self, results):
         self.results = [i for i in reversed(results)]
 
@@ -96,7 +94,7 @@ class Return(Instruction):
             raise Done([belt.get(i) for i in reversed(self.results)])
         for i in self.results:
             stack.belt.put(belt.get(i))
-        return stack.pc, stack.belt, stack.prev, False
+        return stack.pc, stack.belt, stack.prev, stack.pc < pc
 
     def tostring(self):
         args = " ".join(["B%d" % i for i in reversed(self.results)])
@@ -105,6 +103,9 @@ class Return(Instruction):
 class Binop(Instruction):
     _immutable_fields_ = ["lhs", "rhs"]
     name = "BINOP"
+
+    classes = {}
+
     def __init__(self, lhs, rhs):
         self.lhs = lhs
         self.rhs = rhs
@@ -113,7 +114,15 @@ class Binop(Instruction):
     def binop(v0, v1):
         raise Exception("abstract method")
 
-    @jit.unroll_safe
+    @staticmethod
+    def get_cls(name):
+        return Binop.classes[name]
+
+    @staticmethod
+    def add_cls(cls):
+        Binop.classes[cls.name] = cls
+
+    @objectmodel.always_inline
     def interpret(self, pc, belt, stack):
         v0 = belt.get(self.lhs)
         v1 = belt.get(self.rhs)
@@ -123,26 +132,44 @@ class Binop(Instruction):
     def tostring(self):
         return "%s B%d B%d" % (self.name, self.lhs, self.rhs)
 
-class Add(Binop):
-    name = "ADD"
+def make_binop(ins_name, op):
+    class BinopImp(Binop):
+        name = ins_name
+        @staticmethod
+        def binop(v0, v1):
+            return op(v0, v1)
+    Binop.add_cls(BinopImp)
+    return BinopImp
 
-    @staticmethod
-    def binop(v0, v1):
-        return v0 + v1
+def make_cmp(ins_name, op):
+    class Cmp(Binop):
+        name = ins_name
+        @staticmethod
+        def binop(v0, v1):
+            return 1 if op(v0, v1) else 0
+    Binop.add_cls(Cmp)
+    return Cmp
 
-class Sub(Binop):
-    name = "SUB"
+BINOPS = [("ADD", op.add),
+          ("SUB", op.sub),
+          ("MUL", op.mul),
+          ("DIV", op.div),
+          ("MOD", op.mod),
+          ]
 
-    @staticmethod
-    def binop(v0, v1):
-        return v0 - v1
+for i in BINOPS:
+    make_binop(*i)
 
-class Lte(Binop):
-    name = "LTE"
+CMPS = [("LTE", op.le ),
+        ("GTE", op.ge ),
+        ("EQ" , op.eq ),
+        ("LT" , op.lt ),
+        ("GT" , op.gt ),
+        ("NEQ", op.ne ),
+        ]
 
-    @staticmethod
-    def binop(v0, v1):
-        return 1 if v0 <= v1 else 0
+for i in CMPS:
+    make_cmp(*i)
 
 class Pick(Instruction):
     _immutable_fields_ = ["pred", "cons", "alt"]
@@ -151,7 +178,6 @@ class Pick(Instruction):
         self.cons = cons
         self.alt  = alt
 
-    @jit.unroll_safe
     def interpret(self, pc, belt, stack):
         belt.put(belt.get(self.cons) if belt.get(self.pred) != 0 else belt.get(self.alt))
         return pc + 1, belt, stack, False
@@ -187,70 +213,59 @@ def parse(input):
         line = [i for i in rstring.split(line, ' ') if i]
         if not line:
             continue
-        ins, args = line[0].lower(), [convert_arg(i, labels) for i in line[1:]]
+        ins, args = line[0].upper(), [convert_arg(i, labels) for i in line[1:]]
         if ins[-1] == ':':
             continue
-        elif ins == "copy":
+        elif ins == "COPY":
             val = Copy(args[0])
-        elif ins == "const":
+        elif ins == "CONST":
             val = Const(args[0])
-        elif ins == "call":
+        elif ins == "CALL":
             val = Call(args[0], args[1:])
-        elif ins == "jump":
+        elif ins == "JUMP":
             val = Jump(args[0])
-        elif ins == "return":
+        elif ins == "RETURN":
             val = Return(args)
-        elif ins == "add":
-            val = Add(args[0], args[1])
-        elif ins ==  "sub":
-            val = Sub(args[0], args[1])
-        elif ins == "lte":
-            val = Lte(args[0], args[1])
-        elif ins == "pick":
+        elif ins == "PICK":
             val = Pick(args[0], args[1], args[2])
+        elif ins in Binop.classes:
+            val = Binop.get_cls(ins)(args[0], args[1])
         else:
             raise Exception("Unparsable instruction %s" % ins)
         program.append(val)
     return program[:]
 
-def get_printable_location(pc, belt_start, program):
+def get_printable_location(pc, program):
     if pc is None or program is None:
         return "Greens are None"
     return "%d: %s" % (pc, program[pc].tostring())
 
 driver = jit.JitDriver(reds=["stack", "belt"],
-                       greens=["pc", "belt_start", "program"],
+                       greens=["pc", "program"],
+                       virtualizables=["belt"],
                        get_printable_location=get_printable_location)
 
 class Belt(object):
+    _virtualizable_ = ["data[*]"]
     def __init__(self):
-        self.start = 0
-        self.data  = [0] * BELT_LEN
+        self      = jit.hint(self, access_directly=True, fresh_virtualizable=True)
+        self.data = [0] * BELT_LEN
 
-    @jit.unroll_safe
     def get(self, idx):
-        jit.promote(self.start)
-        index = (self.start - idx) % BELT_LEN
-        return self.data[index]
-
-    # An operation to ensure that all the data is shifted before a trace (hopefully).
-    # The hope is to ensure all traces have the same value for the `start` field,
-    # as it is used to conver the temporal indexing of the belt to spatial indexing
-    # that the jit can more easily work with.
-    @jit.unroll_safe
-    def reset(self):
-        if self.start == 0:
-            return
-        for i in range(BELT_LEN):
-            j = (self.start + i) % BELT_LEN
-            self.data[i], self.data[j] = self.data[j], self.data[i]
-        self.start = 0
+        idx  = jit.promote(idx)
+        assert 0 <= idx < len(self.data)
+        return self.data[idx]
 
     @jit.unroll_safe
     def put(self, val):
-        jit.promote(self.start)
-        self.start = (self.start + 1) % BELT_LEN
-        self.data[self.start] = val
+        for i in range(BELT_LEN - 1, 0, -1):
+            j = i - 1
+            assert 1 <= i < len(self.data)
+            assert 0 <= j < len(self.data)
+            self.data[i] = self.data[j]
+        self.data[0] = val
+
+binops = unroll.unrolling_iterable(list(Binop.classes.itervalues()))
 
 def main_loop(program):
     pc    = 0
@@ -258,11 +273,11 @@ def main_loop(program):
     stack = None
     try:
         while True:
-            driver.jit_merge_point(pc=pc, belt_start=belt.start, program=program, belt=belt, stack=stack)
+            driver.jit_merge_point(pc=pc, program=program, belt=belt, stack=stack)
             ins = program[pc]
             pc, belt, stack, can_enter = ins.interpret(pc, belt, stack)
             if can_enter:
-                driver.can_enter_jit(pc=pc, belt_start=belt.start, program=program, belt=belt, stack=stack)
+                driver.can_enter_jit(pc=pc, program=program, belt=belt, stack=stack)
     except Done as d:
         print "Results: ", d.values
 

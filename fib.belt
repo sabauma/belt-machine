@@ -1,5 +1,5 @@
 ENTRY:
-    CONST 40
+    CONST 42
     CONST FIB
     CALL B0  B1
     RETURN B0
