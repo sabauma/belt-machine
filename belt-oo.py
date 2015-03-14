@@ -4,18 +4,11 @@ from   rpython.rlib import streamio
 from   rpython.rlib import jit, debug, objectmodel, unroll
 from   rpython.rlib import rstring
 
-BELT_LEN = 9
+BELT_LEN = 16
 
 class Done(Exception):
     def __init__(self, vals):
         self.values = vals
-
-class ActivationRecord(object):
-    _immutable_fields_ = ["pc", "belt", "prev"]
-    def __init__(self, pc, belt, prev):
-        self.pc   = pc
-        self.belt = belt
-        self.prev = prev
 
 class Instruction(object):
     def __init__(self):
@@ -35,7 +28,7 @@ class Copy(Instruction):
 
     def interpret(self, pc, belt, stack):
         belt.put(belt.get(self.value))
-        return pc + 1, belt, stack, False
+        return pc + 1, stack, False
 
     def tostring(self):
         return "COPY %d" % self.value
@@ -47,7 +40,7 @@ class Const(Instruction):
 
     def interpret(self, pc, belt, stack):
         belt.put(self.value)
-        return pc + 1, belt, stack, False
+        return pc + 1, stack, False
 
     def tostring(self):
         return "CONST %d" % self.value
@@ -60,12 +53,13 @@ class Call(Instruction):
 
     @jit.unroll_safe
     def interpret(self, pc, belt, stack):
-        stack    = ActivationRecord(pc + 1, belt, stack)
-        new_belt = Belt()
-        target   = belt.get(self.destination)
-        for i in self.args:
-            new_belt.put(belt.get(i))
-        return target, new_belt, stack, target < pc
+        stack  = ActivationRecord(pc + 1, belt, stack)
+        target = belt.get(self.destination)
+        vals   = [belt.get(i) for i in self.args]
+        belt.reset()
+        for v in vals:
+            belt.put(v)
+        return target, stack, target < pc
 
     def tostring(self):
         args = " ".join(["B%d" % i for i in reversed(self.args)])
@@ -78,7 +72,7 @@ class Jump(Instruction):
 
     def interpret(self, pc, belt, stack):
         target = belt.get(self.destination)
-        return target, belt, stack, target < pc
+        return target, stack, target < pc
 
     def tostring(self):
         return "JUMP B%d" % self.destination
@@ -92,9 +86,11 @@ class Return(Instruction):
     def interpret(self, pc, belt, stack):
         if stack is None:
             raise Done([belt.get(i) for i in reversed(self.results)])
-        for i in self.results:
-            stack.belt.put(belt.get(i))
-        return stack.pc, stack.belt, stack.prev, stack.pc < pc
+        vals = [belt.get(i) for i in self.results]
+        belt.restore(stack)
+        for v in vals:
+            belt.put(v)
+        return stack.pc, stack.prev, stack.pc < pc
 
     def tostring(self):
         args = " ".join(["B%d" % i for i in reversed(self.results)])
@@ -127,7 +123,7 @@ class Binop(Instruction):
         v0 = belt.get(self.lhs)
         v1 = belt.get(self.rhs)
         belt.put(self.binop(v0, v1))
-        return pc + 1, belt, stack, False
+        return pc + 1, stack, False
 
     def tostring(self):
         return "%s B%d B%d" % (self.name, self.lhs, self.rhs)
@@ -160,12 +156,12 @@ BINOPS = [("ADD", op.add),
 for i in BINOPS:
     make_binop(*i)
 
-CMPS = [("LTE", op.le ),
-        ("GTE", op.ge ),
-        ("EQ" , op.eq ),
-        ("LT" , op.lt ),
-        ("GT" , op.gt ),
-        ("NEQ", op.ne ),
+CMPS = [("LTE", op.le),
+        ("GTE", op.ge),
+        ("EQ" , op.eq),
+        ("LT" , op.lt),
+        ("GT" , op.gt),
+        ("NEQ", op.ne),
         ]
 
 for i in CMPS:
@@ -180,7 +176,7 @@ class Pick(Instruction):
 
     def interpret(self, pc, belt, stack):
         belt.put(belt.get(self.cons) if belt.get(self.pred) != 0 else belt.get(self.alt))
-        return pc + 1, belt, stack, False
+        return pc + 1, stack, False
 
     def tostring(self):
         return "PICK B%d B%d B%d" % (self.pred, self.cons, self.alt)
@@ -245,27 +241,49 @@ driver = jit.JitDriver(reds=["stack", "belt"],
                        virtualizables=["belt"],
                        get_printable_location=get_printable_location)
 
-class Belt(object):
-    _virtualizable_ = ["data[*]"]
-    def __init__(self):
-        self      = jit.hint(self, access_directly=True, fresh_virtualizable=True)
-        self.data = [0] * BELT_LEN
+def make_belt(LEN):
+    attrs    = ["elem_%d" % d for d in range(LEN)]
+    unrolled = unroll.unrolling_iterable(enumerate(attrs))
+    swaps    = unroll.unrolling_iterable(zip(attrs[-2::-1], attrs[-1::-1]))
 
-    def get(self, idx):
-        idx  = jit.promote(idx)
-        assert 0 <= idx < len(self.data)
-        return self.data[idx]
+    class Belt(object):
+        _virtualizable_ = attrs
+        def __init__(self, vals=None):
+            self = jit.hint(self, access_directly=True, fresh_virtualizable=True)
+            self.reset()
 
-    @jit.unroll_safe
-    def put(self, val):
-        for i in range(BELT_LEN - 1, 0, -1):
-            j = i - 1
-            assert 1 <= i < len(self.data)
-            assert 0 <= j < len(self.data)
-            self.data[i] = self.data[j]
-        self.data[0] = val
+        def get(self, idx):
+            jit.promote(idx)
+            for i, attr in unrolled:
+                if i == idx:
+                    return getattr(self, attr)
+            raise IndexError
 
-binops = unroll.unrolling_iterable(list(Binop.classes.itervalues()))
+        def put(self, val):
+            for src, target in swaps:
+                setattr(self, target, getattr(self, src))
+            setattr(self, attrs[0], val)
+
+        def reset(self):
+            for _, attr in unrolled:
+                setattr(self, attr, 0)
+
+        def restore(self, ar):
+            for _, attr in unrolled:
+                setattr(self, attr, getattr(ar, attr))
+
+    class ActivationRecord(object):
+        _immutable_fields_ = ["pc", "prev"] + attrs
+        def __init__(self, pc, belt, prev):
+            self.pc   = pc
+            self.belt = belt
+            self.prev = prev
+            for i, attr in unrolled:
+                setattr(self, attr, getattr(belt, attr))
+
+    return Belt, ActivationRecord
+
+Belt, ActivationRecord = make_belt(BELT_LEN)
 
 def main_loop(program):
     pc    = 0
@@ -275,7 +293,8 @@ def main_loop(program):
         while True:
             driver.jit_merge_point(pc=pc, program=program, belt=belt, stack=stack)
             ins = program[pc]
-            pc, belt, stack, can_enter = ins.interpret(pc, belt, stack)
+            t = type(ins)
+            pc, stack, can_enter = ins.interpret(pc, belt, stack)
             if can_enter:
                 driver.can_enter_jit(pc=pc, program=program, belt=belt, stack=stack)
     except Done as d:
@@ -311,3 +330,4 @@ def target(driver, args):
 if __name__ == "__main__":
     import sys
     entry_point(sys.argv)
+
