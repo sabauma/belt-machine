@@ -46,15 +46,16 @@ class Const(Instruction):
         return "CONST %d" % self.value
 
 class Call(Instruction):
-    _immutable_fields_ = ["destination", "args[*]"]
+    _immutable_fields_ = ["destination", "args[*]", "targets"]
     def __init__(self, destination, args):
         self.destination = destination
         self.args        = [i for i in reversed(args)]
+        self.targets     = {}
 
     @jit.unroll_safe
     def interpret(self, pc, belt, stack):
+        target = jit.promote(belt.get(self.destination))
         stack  = ActivationRecord(pc + 1, belt, stack)
-        target = belt.get(self.destination)
         vals   = [belt.get(i) for i in self.args]
         belt.reset()
         for v in vals:
@@ -71,7 +72,7 @@ class Jump(Instruction):
         self.destination = destination
 
     def interpret(self, pc, belt, stack):
-        target = belt.get(self.destination)
+        target = jit.promote(belt.get(self.destination))
         return target, stack, target < pc
 
     def tostring(self):
@@ -87,10 +88,11 @@ class Return(Instruction):
         if stack is None:
             raise Done([belt.get(i) for i in reversed(self.results)])
         vals = [belt.get(i) for i in self.results]
-        belt.restore(stack)
+        stack.restore(belt)
         for v in vals:
             belt.put(v)
-        return stack.pc, stack.prev, stack.pc < pc
+        ret = jit.promote(stack.pc)
+        return ret, stack.prev, ret < pc
 
     def tostring(self):
         args = " ".join(["B%d" % i for i in reversed(self.results)])
@@ -118,7 +120,6 @@ class Binop(Instruction):
     def add_cls(cls):
         Binop.classes[cls.name] = cls
 
-    @objectmodel.always_inline
     def interpret(self, pc, belt, stack):
         v0 = belt.get(self.lhs)
         v1 = belt.get(self.rhs)
@@ -134,6 +135,7 @@ def make_binop(ins_name, op):
         @staticmethod
         def binop(v0, v1):
             return op(v0, v1)
+    BinopImp.__name__ += "ins_name"
     Binop.add_cls(BinopImp)
     return BinopImp
 
@@ -242,22 +244,21 @@ driver = jit.JitDriver(reds=["stack", "belt"],
                        get_printable_location=get_printable_location)
 
 def make_belt(LEN):
-    attrs    = ["elem_%d" % d for d in range(LEN)]
+    attrs    = ["_elem_%d_of_%d" % (d, LEN) for d in range(LEN)]
     unrolled = unroll.unrolling_iterable(enumerate(attrs))
     swaps    = unroll.unrolling_iterable(zip(attrs[-2::-1], attrs[-1::-1]))
 
     class Belt(object):
         _virtualizable_ = attrs
-        def __init__(self, vals=None):
+        def __init__(self):
             self = jit.hint(self, access_directly=True, fresh_virtualizable=True)
             self.reset()
 
         def get(self, idx):
-            jit.promote(idx)
             for i, attr in unrolled:
                 if i == idx:
                     return getattr(self, attr)
-            raise IndexError
+            assert False, "belt index error"
 
         def put(self, val):
             for src, target in swaps:
@@ -268,22 +269,23 @@ def make_belt(LEN):
             for _, attr in unrolled:
                 setattr(self, attr, 0)
 
-        def restore(self, ar):
-            for _, attr in unrolled:
-                setattr(self, attr, getattr(ar, attr))
-
     class ActivationRecord(object):
         _immutable_fields_ = ["pc", "prev"] + attrs
         def __init__(self, pc, belt, prev):
             self.pc   = pc
-            self.belt = belt
             self.prev = prev
             for i, attr in unrolled:
                 setattr(self, attr, getattr(belt, attr))
 
+        def restore(self, belt):
+            for _, attr in unrolled:
+                setattr(belt, attr, getattr(self, attr))
+
     return Belt, ActivationRecord
 
 Belt, ActivationRecord = make_belt(BELT_LEN)
+
+binops = unroll.unrolling_iterable(Binop.classes.values())
 
 def main_loop(program):
     pc    = 0
@@ -293,7 +295,6 @@ def main_loop(program):
         while True:
             driver.jit_merge_point(pc=pc, program=program, belt=belt, stack=stack)
             ins = program[pc]
-            t = type(ins)
             pc, stack, can_enter = ins.interpret(pc, belt, stack)
             if can_enter:
                 driver.can_enter_jit(pc=pc, program=program, belt=belt, stack=stack)
