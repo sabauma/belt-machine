@@ -1,21 +1,30 @@
 
 import operator as op
-from   rpython.rlib import streamio
-from   rpython.rlib import jit, debug, objectmodel, unroll
-from   rpython.rlib import rstring
+from   rpython.rlib          import streamio
+from   rpython.rlib          import jit, debug, objectmodel, unroll
+from   rpython.rlib          import rstring
+from   rpython.rlib.listsort import TimSort
 
-BELT_LEN = 16
+BELT_LEN = 8
 
 class Done(Exception):
     def __init__(self, vals):
         self.values = vals
 
 class Instruction(object):
+
+    _immutable_fields_ = ['loop_header']
+
+    loop_header = False
+
     def __init__(self):
         raise Exception("Abstract base class")
 
     def interpret(self, pc, belt, stack):
         raise Exception("Abstract base class")
+
+    def set_loop_header(self):
+        self.loop_header = True
 
     def tostring(self):
         return str(self)
@@ -28,7 +37,7 @@ class Copy(Instruction):
 
     def interpret(self, pc, belt, stack):
         belt.put(belt.get(self.value))
-        return pc + 1, stack, False
+        return pc + 1, stack, -1
 
     def tostring(self):
         return "COPY %d" % self.value
@@ -40,27 +49,28 @@ class Const(Instruction):
 
     def interpret(self, pc, belt, stack):
         belt.put(self.value)
-        return pc + 1, stack, False
+        return pc + 1, stack, -1
 
     def tostring(self):
         return "CONST %d" % self.value
 
 class Call(Instruction):
-    _immutable_fields_ = ["destination", "args[*]", "targets"]
-    def __init__(self, destination, args):
+    _immutable_fields_ = ["destination", "args[*]", "saves"]
+    def __init__(self, destination, saves, args):
         self.destination = destination
         self.args        = [i for i in reversed(args)]
-        self.targets     = {}
+        self.saves       = saves
 
     @jit.unroll_safe
     def interpret(self, pc, belt, stack):
         target = jit.promote(belt.get(self.destination))
-        stack  = ActivationRecord(pc + 1, belt, stack)
+        # stack  = ActivationRecord(pc + 1, belt, stack)
+        stack  = make_activation_record(self.saves, pc + 1, belt, stack)
         vals   = [belt.get(i) for i in self.args]
         belt.reset()
         for v in vals:
             belt.put(v)
-        return target, stack, target < pc
+        return target, stack, -1
 
     def tostring(self):
         args = " ".join(["B%d" % i for i in reversed(self.args)])
@@ -73,7 +83,7 @@ class Jump(Instruction):
 
     def interpret(self, pc, belt, stack):
         target = jit.promote(belt.get(self.destination))
-        return target, stack, target < pc
+        return target, stack, -1
 
     def tostring(self):
         return "JUMP B%d" % self.destination
@@ -92,7 +102,7 @@ class Return(Instruction):
         for v in vals:
             belt.put(v)
         ret = jit.promote(stack.pc)
-        return ret, stack.prev, ret < pc
+        return ret, stack.prev, -1
 
     def tostring(self):
         args = " ".join(["B%d" % i for i in reversed(self.results)])
@@ -124,7 +134,7 @@ class Binop(Instruction):
         v0 = belt.get(self.lhs)
         v1 = belt.get(self.rhs)
         belt.put(self.binop(v0, v1))
-        return pc + 1, stack, False
+        return pc + 1, stack, -1
 
     def tostring(self):
         return "%s B%d B%d" % (self.name, self.lhs, self.rhs)
@@ -178,10 +188,61 @@ class Pick(Instruction):
 
     def interpret(self, pc, belt, stack):
         belt.put(belt.get(self.cons) if belt.get(self.pred) != 0 else belt.get(self.alt))
-        return pc + 1, stack, False
+        return pc + 1, stack, -1
 
     def tostring(self):
         return "PICK B%d B%d B%d" % (self.pred, self.cons, self.alt)
+
+class IndirectionInstruction(Instruction):
+
+    _immutable_fields_ = ['inner']
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def interpret(self, pc, belt, stack):
+        return self.inner.interpret(pc, belt, stack)
+
+    def direct_interpret(self, pc, belt, stack):
+        return self.inner.interpret(pc, belt, stack)
+
+class DispatchNode(IndirectionInstruction):
+
+    _immutable_fields_ = ['alternatives[*]']
+
+    def __init__(self, inner):
+        IndirectionInstruction.__init__(self, inner)
+        self.loop_header = True
+        self.alternatives = []
+
+    @jit.elidable_promote('all')
+    def get_alternative(self, alt):
+        return self.alternatives[alt]
+
+    def add_alternative(self, alt):
+        idx = len(self.alternatives)
+        self.alternatives = self.alternatives + [alt]
+        return idx
+
+    def perform_dispatch(self, index, pc, stack):
+        alt = self.get_alternative(index)
+        return alt, stack, index
+
+class CaseNode(IndirectionInstruction):
+
+    _immutable_fields_ = ['index', 'dispatch_node']
+
+    def __init__(self, inner, index, dispatch_node):
+        IndirectionInstruction.__init__(self, inner)
+        inner.loop_header = False
+        self.index = index
+        self.dispatch_node = dispatch_node
+
+    def interpret(self, pc, belt, stack):
+        return self.dispatch_node, stack, self.index
+
+    def set_loop_header(self):
+        pass
 
 def get_labels(instructions):
     labels = {}
@@ -219,7 +280,7 @@ def parse(input):
         elif ins == "CONST":
             val = Const(args[0])
         elif ins == "CALL":
-            val = Call(args[0], args[1:])
+            val = Call(args[0], args[1], args[2:])
         elif ins == "JUMP":
             val = Jump(args[0])
         elif ins == "RETURN":
@@ -238,10 +299,11 @@ def get_printable_location(pc, program):
         return "Greens are None"
     return "%d: %s" % (pc, program[pc].tostring())
 
-driver = jit.JitDriver(reds=["stack", "belt"],
+driver = jit.JitDriver(reds=["dispatch_index", "stack", "belt", "flowgraph"],
                        greens=["pc", "program"],
                        virtualizables=["belt"],
-                       get_printable_location=get_printable_location)
+                       get_printable_location=get_printable_location,
+                       should_unroll_one_iteration=lambda *args: True)
 
 def make_belt(LEN):
     attrs    = ["_elem_%d_of_%d" % (d, LEN) for d in range(LEN)]
@@ -269,37 +331,221 @@ def make_belt(LEN):
             for _, attr in unrolled:
                 setattr(self, attr, 0)
 
-    class ActivationRecord(object):
-        _immutable_fields_ = ["pc", "prev"] + attrs
+    class AbstractActivationRecord(object):
+        _immutable_fields_ = ["pc", "prev"]
+
         def __init__(self, pc, belt, prev):
-            self.pc   = pc
+            self.pc = pc
             self.prev = prev
-            for i, attr in unrolled:
-                setattr(self, attr, getattr(belt, attr))
 
-        def restore(self, belt):
-            for _, attr in unrolled:
-                setattr(belt, attr, getattr(self, attr))
+    def make_activation_record(size):
 
-    return Belt, ActivationRecord
+        ar_attrs = unroll.unrolling_iterable(list(attrs)[:size])
 
-Belt, ActivationRecord = make_belt(BELT_LEN)
+        class ActivationRecord(AbstractActivationRecord):
+            _immutable_fields_ = attrs
+            def __init__(self, pc, belt, prev):
+                AbstractActivationRecord.__init__(self, pc, belt, prev)
+                for attr in ar_attrs:
+                    setattr(self, attr, getattr(belt, attr))
+
+            def restore(self, belt):
+                for attr in ar_attrs:
+                    setattr(belt, attr, getattr(self, attr))
+
+        ActivationRecord.__name__ += "Size%d" % size
+        return ActivationRecord
+
+    record_classes = [make_activation_record(i) for i in range(LEN)]
+
+    def make_ar(size, pc, belt, prev):
+        cls = record_classes[size]
+        return cls(pc, belt, prev)
+
+    return Belt, make_ar
+
+Belt, make_activation_record = make_belt(BELT_LEN)
 
 binops = unroll.unrolling_iterable(Binop.classes.values())
+
+EMPTY = {}
+
+class Flowgraph(object):
+
+    _immutable_fields_ = ['_successors', '_predecessors', 'program']
+
+    def __init__(self, program):
+        self._successors   = {}
+        self._predecessors = {}
+        self.program       = program
+
+    def add_edge(self, source, destination):
+        succ = self.successors(source)
+        # pred = self.predecessors(destination)
+        if destination not in succ:
+            succ[destination] = True
+            self.find_loops()
+            self.component_analysis()
+
+        # if source not in pred:
+            # pred[source] = True
+
+    def component_analysis(self):
+        scc = SCC(self._successors)
+        scc.compute_scc()
+        components = scc.scc_set
+
+        for component in components:
+            if len(component) == 1:
+                continue
+            headers = [i for i in component if self.program[i].loop_header]
+            TimSort(headers).sort()
+            if len(headers) <= 1:
+                continue
+
+            master, subs = headers[0], headers[1:]
+            master_ins = self.program[master]
+            if not isinstance(master_ins, DispatchNode):
+                self.program[master] = master_ins = DispatchNode(master_ins)
+            for sub in subs:
+                sub_ins = self.program[sub]
+                if not isinstance(sub_ins, CaseNode):
+                    idx = master_ins.add_alternative(sub)
+                    self.program[sub] = sub_ins = CaseNode(sub_ins, idx, master)
+                else:
+                    assert sub_ins.dispatch_node == master
+
+    def successors(self, node):
+        links = self._successors.get(node, None)
+        if links is None:
+            self._successors[node] = links = {}
+        return links
+
+    def predecessors(self, node):
+        links = self._predecessors.get(node, None)
+        if links is None:
+            self._predecessors[node] = links = {}
+        return links
+
+    # Perform a depth first traversal to find back edges
+    def find_loops(self):
+        if jit.we_are_jitted():
+            return
+        seen = {}
+        todo = [0]
+        while todo:
+            node = todo.pop()
+            if node in seen:
+                self.program[node].set_loop_header()
+                # self.program[node].loop_header = True
+                # print "marking loop_header %d: %s" % (node, self.program[node].tostring())
+                continue
+            seen[node] = True
+            for succ in self.successors(node):
+                todo.append(succ)
+
+    def print_form(self):
+        output = []
+        for i, ins in enumerate(self.program):
+            output.append("%d: %s goes to" % (i, ins.tostring()))
+            for succ in self.successors(i):
+                succ_ins = self.program[succ]
+                output.append("    %d: %s" % (succ, succ_ins.tostring()))
+        return "\n".join(output)
+
+class VertexData(object):
+
+    __slots__ = ('vertex', 'index', 'lowlink', 'onstack')
+
+    def __init__(self, vertex, index, lowlink):
+        self.vertex  = vertex
+        self.index   = index
+        self.lowlink = lowlink
+        self.onstack = False
+
+class SCC(object):
+
+    def __init__(self, graph):
+        self.graph   = graph
+        self.index   = 0
+        self.S       = []
+        self.data    = {}
+        self.scc_set = []
+
+    def lookup_vertex(self, v):
+        data = self.data.get(v, None)
+        if data is None:
+            data = VertexData(v, -1, -1)
+            self.data[v] = data
+        return data
+
+    def strongconnect(self, v):
+        vertex_v         = self.lookup_vertex(v)
+        vertex_v.index   = self.index
+        vertex_v.lowlink = self.index
+        self.index += 1
+        self.S.append(vertex_v)
+        vertex_v.onstack = True
+
+        # For each successor of v
+        for w in self.graph.get(v, EMPTY):
+            vertex_w = self.lookup_vertex(w)
+            if vertex_w.index == -1:
+                self.strongconnect(w)
+                vertex_v.lowlink = min(vertex_v.lowlink, vertex_w.lowlink)
+            elif vertex_w.onstack:
+                vertex_v.lowlink = min(vertex_v.lowlink, vertex_w.index)
+
+        if vertex_v.lowlink == vertex_v.index:
+            newscc = {}
+            while True:
+                w = self.S.pop()
+                w.onstack = False
+                newscc[w.vertex] = None
+                if w is vertex_v:
+                    break
+            self.scc_set.append(newscc)
+
+    def compute_scc(self):
+        for v in self.graph.iterkeys():
+            if v is None:
+                continue
+            vertex_v = self.lookup_vertex(v)
+            if vertex_v.index == -1:
+                self.strongconnect(v)
+
+@jit.elidable_promote('all')
+def get_instruction(program, index):
+    return program[index]
 
 def main_loop(program):
     pc    = 0
     belt  = Belt()
     stack = None
+    dispatch_index = -1
+    flowgraph = Flowgraph(program)
     try:
         while True:
-            driver.jit_merge_point(pc=pc, program=program, belt=belt, stack=stack)
-            ins = program[pc]
-            pc, stack, can_enter = ins.interpret(pc, belt, stack)
-            if can_enter:
-                driver.can_enter_jit(pc=pc, program=program, belt=belt, stack=stack)
+            driver.jit_merge_point(pc=pc, program=program, dispatch_index=dispatch_index, belt=belt, stack=stack, flowgraph=flowgraph)
+            ins = get_instruction(program, pc)
+            dispatch_index = jit.promote(dispatch_index)
+            if dispatch_index != -1:
+                if isinstance(ins, DispatchNode):
+                    new_pc, stack, dispatch_index = ins.perform_dispatch(dispatch_index, pc, stack)
+                else:
+                    assert isinstance(ins, CaseNode)
+                    new_pc, stack, dispatch_index = IndirectionInstruction.interpret(ins, pc, belt, stack)
+            else:
+                new_pc, stack, dispatch_index = ins.interpret(pc, belt, stack)
+
+            if not jit.we_are_jitted():
+                flowgraph.add_edge(pc, new_pc)
+            pc = new_pc
+            if get_instruction(program, pc).loop_header:
+                driver.can_enter_jit(pc=pc, program=program, dispatch_index=dispatch_index, belt=belt, stack=stack, flowgraph=flowgraph)
     except Done as d:
         print "Results: ", d.values
+        print flowgraph.print_form()
 
 def readfile_rpython(fname):
     f = streamio.open_file_as_stream(fname)
@@ -313,6 +559,10 @@ def run(fname):
     main_loop(program)
 
 def entry_point(argv):
+    if len(argv) == 3:
+        jitargs = argv[1]
+        del argv[1]
+        jit.set_user_param(None, jitargs)
     try:
         filename = argv[1]
     except IndexError:

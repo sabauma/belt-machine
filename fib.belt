@@ -1,7 +1,7 @@
 ENTRY:
-    CONST 40
+    CONST 42
     CONST FIB
-    CALL B0  B1
+    CALL B0 0 B1
     RETURN B0
 FIB:
     CONST 1
@@ -16,7 +16,7 @@ NEXT:
     SUB B5  B4
     SUB B0  B5
     CONST FIB
-    CALL B0  B2
-    CALL B1  B2
+    CALL B0 2 B2
+    CALL B1 1 B2
     ADD B0  B1
     RETURN B0
